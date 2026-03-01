@@ -1,11 +1,12 @@
 'use client';
 
-import React, { createContext, useContext, useReducer, useEffect, useRef, ReactNode } from 'react';
+import React, { createContext, useContext, useReducer, useEffect, useRef, useCallback, ReactNode } from 'react';
 import {
   AppState,
   AppAction,
   ForecastConfig,
   Customer,
+  ImportRecord,
   MonthlyDataEntry,
 } from './types';
 import { DEFAULT_BENCHMARKS } from './constants';
@@ -217,37 +218,103 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(appReducer, initialState);
   const hydrated = useRef(false);
 
-  // Hydrate from localStorage on mount
+  // Hydrate from API (with localStorage fallback) on mount
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored) {
-        const customers = JSON.parse(stored) as Customer[];
-        dispatch({ type: 'LOAD_CUSTOMERS', payload: customers });
+    async function hydrate() {
+      let customersLoaded = false;
+      let historyLoaded = false;
+
+      try {
+        const [custRes, histRes] = await Promise.all([
+          fetch('/api/data/customers'),
+          fetch('/api/data/import-history'),
+        ]);
+
+        if (custRes.ok) {
+          const { customers } = await custRes.json();
+          if (Array.isArray(customers) && customers.length > 0) {
+            dispatch({ type: 'LOAD_CUSTOMERS', payload: customers });
+            customersLoaded = true;
+          }
+        }
+
+        if (histRes.ok) {
+          const { importHistory } = await histRes.json();
+          if (Array.isArray(importHistory) && importHistory.length > 0) {
+            dispatch({ type: 'LOAD_IMPORT_HISTORY', payload: importHistory });
+            historyLoaded = true;
+          }
+        }
+      } catch {
+        // API unavailable — fall back to localStorage
       }
-    } catch { /* ignore parse errors */ }
-    try {
-      const storedHistory = localStorage.getItem(IMPORT_HISTORY_STORAGE_KEY);
-      if (storedHistory) {
-        dispatch({ type: 'LOAD_IMPORT_HISTORY', payload: JSON.parse(storedHistory) });
+
+      // Fallback to localStorage if API returned nothing
+      if (!customersLoaded) {
+        try {
+          const stored = localStorage.getItem(STORAGE_KEY);
+          if (stored) {
+            dispatch({ type: 'LOAD_CUSTOMERS', payload: JSON.parse(stored) });
+          }
+        } catch { /* ignore */ }
       }
-    } catch { /* ignore parse errors */ }
-    hydrated.current = true;
+
+      if (!historyLoaded) {
+        try {
+          const storedHistory = localStorage.getItem(IMPORT_HISTORY_STORAGE_KEY);
+          if (storedHistory) {
+            dispatch({ type: 'LOAD_IMPORT_HISTORY', payload: JSON.parse(storedHistory) });
+          }
+        } catch { /* ignore */ }
+      }
+
+      hydrated.current = true;
+    }
+
+    hydrate();
   }, []);
 
-  // Persist customers to localStorage on change
+  // Debounced API save helper
+  const customersSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const historySaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const debouncedSaveCustomers = useCallback((customers: Customer[]) => {
+    if (customersSaveTimer.current) clearTimeout(customersSaveTimer.current);
+    customersSaveTimer.current = setTimeout(() => {
+      fetch('/api/data/customers', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ customers }),
+      }).catch(() => { /* silently fail — localStorage is the fallback */ });
+    }, 500);
+  }, []);
+
+  const debouncedSaveHistory = useCallback((importHistory: ImportRecord[]) => {
+    if (historySaveTimer.current) clearTimeout(historySaveTimer.current);
+    historySaveTimer.current = setTimeout(() => {
+      fetch('/api/data/import-history', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ importHistory }),
+      }).catch(() => { /* silently fail */ });
+    }, 500);
+  }, []);
+
+  // Persist customers to localStorage + API on change
   useEffect(() => {
     if (hydrated.current) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state.customers));
+      debouncedSaveCustomers(state.customers);
     }
-  }, [state.customers]);
+  }, [state.customers, debouncedSaveCustomers]);
 
-  // Persist import history to localStorage on change
+  // Persist import history to localStorage + API on change
   useEffect(() => {
     if (hydrated.current) {
       localStorage.setItem(IMPORT_HISTORY_STORAGE_KEY, JSON.stringify(state.importHistory));
+      debouncedSaveHistory(state.importHistory);
     }
-  }, [state.importHistory]);
+  }, [state.importHistory, debouncedSaveHistory]);
 
   return (
     <AppContext.Provider value={{ state, dispatch }}>
